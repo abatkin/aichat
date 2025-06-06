@@ -2,17 +2,21 @@ use super::*;
 
 use crate::utils::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256, strip_think_tag};
 
-use anyhow::{anyhow, bail, Context, Result};
-use aws_config::default_provider::credentials::DefaultCredentialsChain;
-use aws_config::profile::ProfileFileCredentialsProvider;
-use aws_config::provider_config::ProviderConfig;
-use aws_config::{BehaviorVersion, Region};
-use aws_credential_types::provider::ProvideCredentials;
+use anyhow::{bail, Context, Result};
 use aws_credential_types::Credentials;
 use aws_smithy_eventstream::frame::{DecodedFrame, MessageFrameDecoder};
 use aws_smithy_eventstream::smithy::parse_response_headers;
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
+#[cfg(feature = "aws-credential-chain")]
+use {
+    aws_config::default_provider::credentials::DefaultCredentialsChain,
+    aws_config::profile::ProfileFileCredentialsProvider,
+    aws_config::provider_config::ProviderConfig,
+    aws_config::{BehaviorVersion, Region},
+    aws_credential_types::provider::ProvideCredentials,
+};
+
 use futures_util::StreamExt;
 use indexmap::IndexMap;
 use reqwest::{Client as ReqwestClient, Method, RequestBuilder};
@@ -24,6 +28,7 @@ pub struct BedrockConfig {
     pub name: Option<String>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+    #[cfg(feature = "aws-credential-chain")]
     pub profile: Option<String>,
     pub region: Option<String>,
     #[serde(default)]
@@ -35,6 +40,7 @@ pub struct BedrockConfig {
 impl BedrockClient {
     config_get_fn!(access_key_id, get_access_key_id);
     config_get_fn!(secret_access_key, get_secret_access_key);
+    #[cfg(feature = "aws-credential-chain")]
     config_get_fn!(profile, get_profile);
     config_get_fn!(region, get_region);
 
@@ -74,12 +80,8 @@ impl BedrockClient {
 
         let builder = aws_fetch(
             client,
-            &AwsCredentials {
-                access_key_id: credentials.access_key_id().into(),
-                secret_access_key: credentials.secret_access_key().into(),
-                session_token: credentials.session_token().map(|v| v.into()),
-                region,
-            },
+            &credentials,
+            &region,
             AwsRequest {
                 method: Method::POST,
                 host,
@@ -126,12 +128,8 @@ impl BedrockClient {
 
         let builder = aws_fetch(
             client,
-            &AwsCredentials {
-                access_key_id: credentials.access_key_id().into(),
-                secret_access_key: credentials.secret_access_key().into(),
-                session_token: credentials.session_token().map(|v| v.into()),
-                region,
-            },
+            &credentials,
+            &region,
             AwsRequest {
                 method: Method::POST,
                 host,
@@ -146,6 +144,7 @@ impl BedrockClient {
         Ok(builder)
     }
 
+    #[cfg(feature = "aws-credential-chain")]
     async fn determine_region(&self) -> Result<String> {
         let maybe_region = self.get_region();
         if maybe_region.is_ok() {
@@ -160,7 +159,12 @@ impl BedrockClient {
             return Ok(maybe_region.to_string());
         }
 
-        Err(anyhow!("Unable to determine region"))
+        bail!("Unable to determine region")
+    }
+
+    #[cfg(not(feature = "aws-credential-chain"))]
+    async fn determine_region(&self) -> Result<String> {
+        self.get_region()
     }
 
     async fn determine_credentials(&self, region: &str) -> Result<Credentials> {
@@ -176,6 +180,11 @@ impl BedrockClient {
             ));
         }
 
+        self.find_environment_credentials(region).await
+    }
+
+    #[cfg(feature = "aws-credential-chain")]
+    async fn find_environment_credentials(&self, region: &str) -> Result<Credentials> {
         let conf =
             ProviderConfig::without_region().with_region(Some(Region::new(region.to_string())));
 
@@ -198,6 +207,11 @@ impl BedrockClient {
             .provide_credentials()
             .await
             .context("Unable to find AWS credentials")
+    }
+
+    #[cfg(not(feature = "aws-credential-chain"))]
+    async fn find_environment_credentials(&self, _: &str) -> Result<Credentials> {
+        bail!("Unable to determine AWS credentials")
     }
 }
 
@@ -587,14 +601,6 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
 }
 
 #[derive(Debug)]
-struct AwsCredentials {
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-    region: String,
-}
-
-#[derive(Debug)]
 struct AwsRequest {
     method: Method,
     host: String,
@@ -607,7 +613,8 @@ struct AwsRequest {
 
 fn aws_fetch(
     client: &ReqwestClient,
-    credentials: &AwsCredentials,
+    credentials: &Credentials,
+    region: &str,
     request: AwsRequest,
 ) -> Result<RequestBuilder> {
     let AwsRequest {
@@ -619,7 +626,6 @@ fn aws_fetch(
         mut headers,
         body,
     } = request;
-    let region = &credentials.region;
 
     let endpoint = format!("https://{}{}", host, uri);
 
@@ -664,7 +670,7 @@ fn aws_fetch(
     );
 
     let signing_key = gen_signing_key(
-        &credentials.secret_access_key,
+        &credentials.secret_access_key(),
         &date_stamp,
         region,
         &service,
@@ -674,12 +680,16 @@ fn aws_fetch(
 
     let authorization_header = format!(
         "{} Credential={}/{}, SignedHeaders={}, Signature={}",
-        algorithm, credentials.access_key_id, credential_scope, signed_headers, signature
+        algorithm,
+        credentials.access_key_id(),
+        credential_scope,
+        signed_headers,
+        signature
     );
 
     headers.insert("authorization".into(), authorization_header);
 
-    if let Some(session_token) = &credentials.session_token {
+    if let Some(session_token) = &credentials.session_token() {
         headers.insert("X-Amz-Security-Token".into(), session_token.to_string());
     }
 
